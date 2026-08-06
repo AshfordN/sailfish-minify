@@ -1,26 +1,17 @@
-[workspace]
-members = ["sailfish-minify-core"]
-resolver = "2"
-
 [package]
-name = "sailfish-minify"
+name = "sailfish-minify-core"
 version = "0.10.2"
 authors = ["Abrudan Paul - Andrei <paulandreiabrudan@proton.me>"]
-description = "Hacky but simple minification support for sailfish, using html-minifier by default"
+description = "Internal unit-test and benchmark harness for the sailfish-minify proc-macro crate (not published)"
 homepage = "https://github.com/pauldotsh/sailfish-minify"
 repository = "https://github.com/pauldotsh/sailfish-minify"
 keywords = ["minification", "html", "sailfish"]
 categories = ["template-engine"]
 license = "MIT"
 edition = "2021"
-exclude = ["sailfish-minify-core"]
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+publish = false
 
 [lib]
-name = "sailfish_minify"
-proc-macro = true
-test = true
 doctest = false
 
 [features]
@@ -30,20 +21,20 @@ minify-components = []
 [dependencies]
 proc-macro2 = "1.0.101"
 syn = { version = "2.0.106", features = ["full"] }
-quote = "1.0.40"
 regex = "1.11.2"
+quote = "1.0.40"
 rayon = "1.11.0"
 pathdiff = "0.2"
 
-
-[dependencies.sailfish-compiler]
-version = "0.10.0"
-default-features = false
-features = ["procmacro"]
-
 [dev-dependencies]
-sailfish = "0.10"
+tempfile = "3"
+criterion = "0.5"
 
 [[test]]
-name = "integration_tests"
-path = "tests/integration_tests.rs"
+name = "unit_tests"
+path = "tests/unit_tests.rs"
+
+[[bench]]
+name = "minify_benchmark"
+path = "benches/minify_benchmark.rs"
+harness = false
