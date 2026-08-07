@@ -344,7 +344,7 @@ pub enum Minifier {
 /// untouched, comments are kept, and optional closing tags are not omitted.
 #[cfg(feature = "native-minifier")]
 pub fn native_minify_cfg() -> minify_html::Cfg {
-    let mut cfg = minify_html::Cfg::spec_compliant();
+    let mut cfg = minify_html::Cfg::new();
     cfg.preserve_chevron_percent_template_syntax = true;
     cfg.keep_comments = true;
     cfg.keep_closing_tags = true;
@@ -632,7 +632,7 @@ fn minify_file_and_components_internal(
     // already in memory, so write it directly and skip the unminified
     // write → read → minified write disk roundtrip (saves two syscalls per
     // template, meaningful for deeply nested or many-include templates).
-    let minified = {
+    let minified: Option<Vec<u8>> = {
         #[cfg(feature = "native-minifier")]
         {
             if matches!(minify_options.minifier, Minifier::Native) {

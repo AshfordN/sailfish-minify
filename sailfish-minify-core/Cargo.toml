@@ -1,6 +1,6 @@
 [package]
 name = "sailfish-minify-core"
-version = "0.10.3"
+version = "0.11.0"
 authors = ["Abrudan Paul - Andrei <paulandreiabrudan@proton.me>"]
 description = "Internal unit-test and benchmark harness for the sailfish-minify proc-macro crate (not published)"
 homepage = "https://github.com/pauldotsh/sailfish-minify"
@@ -24,17 +24,17 @@ native-minifier = ["dep:minify-html"]
 regex = ["dep:regex"]
 
 [dependencies]
-proc-macro2 = "1.0.101"
-syn = { version = "2.0.106", features = ["full"] }
-quote = "1.0.40"
-regex = { version = "1.11.2", optional = true }
-rayon = "1.11.0"
-pathdiff = "0.2"
-minify-html = { version = "0.15", optional = true }
+proc-macro2 = "1.0.107"
+syn = { version = "3.0.3", features = ["full"] }
+quote = "1.0.47"
+regex = { version = "1.13.1", optional = true }
+rayon = "1.12.0"
+pathdiff = "0.2.3"
+minify-html = { version = "0.18.1", optional = true }
 
 [dev-dependencies]
-tempfile = "3"
-criterion = "0.5"
+tempfile = "3.27.0"
+criterion = "0.8.2"
 
 [[test]]
 name = "unit_tests"
