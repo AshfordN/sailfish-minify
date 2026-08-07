@@ -1,6 +1,6 @@
 [package]
 name = "sailfish-minify-core"
-version = "0.10.2"
+version = "0.10.3"
 authors = ["Abrudan Paul - Andrei <paulandreiabrudan@proton.me>"]
 description = "Internal unit-test and benchmark harness for the sailfish-minify proc-macro crate (not published)"
 homepage = "https://github.com/pauldotsh/sailfish-minify"
