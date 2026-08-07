@@ -137,10 +137,44 @@ fn test_include_regex_multiple_matches() {
 // Minify Options Parsing
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "native-minifier")]
+#[test]
+fn test_default_minifier_is_native() {
+    let options = MinifyOptions::default();
+    assert_eq!(options.minifier, Minifier::Native);
+}
+
+#[cfg(not(feature = "native-minifier"))]
 #[test]
 fn test_default_minifier_is_html_minifier() {
     let options = MinifyOptions::default();
     assert_eq!(options.minifier, Minifier::HTMLMinifier);
+}
+
+#[test]
+fn test_native_minifier_parsed() {
+    let tokens: proc_macro2::TokenStream =
+        r#"#[min_with(Native)] struct Foo;"#.parse().unwrap();
+    let mut options = MinifyOptions::default();
+    get_minify_options_from_token_stream(tokens, &mut options).unwrap();
+    assert_eq!(options.minifier, Minifier::Native);
+}
+
+#[cfg(feature = "native-minifier")]
+#[test]
+fn test_native_minifier_minifies_file() {
+    with_minify_lock(|| {
+        let dir = tempdir().unwrap();
+        let input = dir.path().join("in.html");
+        let output = dir.path().join("out.html");
+        fs::write(&input, "<div>\n  <p>  Hello   world  </p>\n</div>").unwrap();
+
+        let options = MinifyOptions { minifier: Minifier::Native };
+        options.minify_file(&input, &output).unwrap();
+
+        let minified = fs::read_to_string(&output).unwrap();
+        assert_eq!(minified, "<div><p>Hello world</p></div>");
+    });
 }
 
 #[test]

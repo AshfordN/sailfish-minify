@@ -15,16 +15,18 @@ publish = false
 doctest = false
 
 [features]
-default = ["minify-components"]
+default = ["minify-components", "native-minifier"]
 minify-components = []
+native-minifier = ["dep:minify-html"]
 
 [dependencies]
 proc-macro2 = "1.0.101"
 syn = { version = "2.0.106", features = ["full"] }
-regex = "1.11.2"
 quote = "1.0.40"
+regex = "1.11.2"
 rayon = "1.11.0"
 pathdiff = "0.2"
+minify-html = { version = "0.15", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

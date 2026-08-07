@@ -1,4 +1,4 @@
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use sailfish_minify_core::{minify_file_and_components, MinifyOptions};
 use std::path::PathBuf;
 use std::process::Command;
@@ -33,11 +33,18 @@ fn minify_via_cli(html: &str) {
     assert!(result.status.success());
 }
 
+#[cfg(feature = "native-minifier")]
 fn minify_via_native(html: &str) {
-    // Rust-native baseline: collapse runs of ASCII whitespace into a single space.
-    // A true native minifier (e.g. minify-html) is not implemented yet.
-    let minified: String = html.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Pure-Rust minification via minify-html: in-memory, no process spawn.
+    let minified =
+        minify_html::minify(html.as_bytes(), &sailfish_minify_core::native_minify_cfg());
     black_box(minified);
+}
+
+#[cfg(not(feature = "native-minifier"))]
+fn minify_via_native_placeholder(html: &str) {
+    // Fallback when the `native-minifier` feature is disabled: no-op passthrough.
+    black_box(html.as_bytes().to_vec());
 }
 
 fn compile_with_include_depth(depth: usize) {
@@ -123,12 +130,20 @@ fn bench_template_sizes(c: &mut Criterion) {
 
     for size in sizes.iter() {
         let html = generate_html_of_size(*size);
+        group.throughput(Throughput::Bytes(*size as u64));
         group.bench_with_input(BenchmarkId::new("minify-html-cli", size), &html, |b, html| {
             b.iter(|| minify_via_cli(black_box(html)))
         });
+        #[cfg(feature = "native-minifier")]
         group.bench_with_input(BenchmarkId::new("minify-html-native", size), &html, |b, html| {
             b.iter(|| minify_via_native(black_box(html)))
         });
+        #[cfg(not(feature = "native-minifier"))]
+        group.bench_with_input(
+            BenchmarkId::new("native-disabled-noop", size),
+            &html,
+            |b, html| b.iter(|| minify_via_native_placeholder(black_box(html))),
+        );
     }
     group.finish();
 }

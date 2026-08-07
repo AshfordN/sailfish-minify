@@ -11,6 +11,14 @@ struct SimpleTemplate {
     name: String,
 }
 
+#[cfg(feature = "native-minifier")]
+#[derive(Minified)]
+#[min_with(Native)]
+#[template(path = "test/simple.stpl")]
+struct NativeMinifiedTemplate {
+    name: String,
+}
+
 #[derive(Minified)]
 #[template(path = "test/small.stpl")]
 struct SmallTemplate {
@@ -194,6 +202,15 @@ fn test_custom_minifier() {
     let result = CustomMinifiedTemplate { name: "World".into() }.render_once().unwrap();
     assert!(!result.contains("  "));
     assert!(result.contains("World"));
+}
+
+#[cfg(feature = "native-minifier")]
+#[test]
+fn test_native_minifier_renders_minified() {
+    let result = NativeMinifiedTemplate { name: "World".into() }.render_once().unwrap();
+    assert!(!result.contains("  "), "native minified output should not contain double spaces");
+    assert!(result.contains("World"));
+    assert!(result.contains("<h1>Hello,"), "interpolated content should survive native minification");
 }
 
 #[test]

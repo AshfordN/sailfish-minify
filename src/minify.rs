@@ -149,18 +149,51 @@ pub fn extract_includes(contents: &str) -> Vec<String> {
         .collect()
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::enum_variant_names)]
 pub enum Minifier {
-    #[default]
+    /// Minify with the `html-minifier` CLI (must be installed and on `PATH`).
     HTMLMinifier,
     Custom(String),
     CustomUnchecked(String),
+    /// Pure-Rust minifier (`minify-html`), enabled by the `native-minifier`
+    /// feature. No `Command` spawn, no system dependency, WASM-compatible.
+    /// This is the default minifier.
+    Native,
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
+/// Build the `minify-html` configuration used by `Minifier::Native`.
+///
+/// Based on the spec-compliant preset so the output is safe, but tuned for
+/// sailfish templates and for parity with the default `html-minifier
+/// --collapse-whitespace` invocation: `<% ... %>` blocks are passed through
+/// untouched, comments are kept, and optional closing tags are not omitted.
+#[cfg(feature = "native-minifier")]
+pub fn native_minify_cfg() -> minify_html::Cfg {
+    let mut cfg = minify_html::Cfg::spec_compliant();
+    cfg.preserve_chevron_percent_template_syntax = true;
+    cfg.keep_comments = true;
+    cfg.keep_closing_tags = true;
+    cfg
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct MinifyOptions {
     pub minifier: Minifier,
+}
+
+impl Default for MinifyOptions {
+    fn default() -> Self {
+        MinifyOptions {
+            // The `Native` minifier is the default when the `native-minifier`
+            // feature is enabled. Without it (e.g. `--no-default-features`),
+            // fall back to the `html-minifier` CLI so templates still minify.
+            #[cfg(feature = "native-minifier")]
+            minifier: Minifier::Native,
+            #[cfg(not(feature = "native-minifier"))]
+            minifier: Minifier::HTMLMinifier,
+        }
+    }
 }
 
 fn run_custom_command_unchecked(cmd: &[&str]) -> Output {
@@ -230,6 +263,19 @@ impl MinifyOptions {
             Minifier::CustomUnchecked(command) => {
                 run_custom_command_unchecked_wrapper(command, input, output);
             }
+            #[cfg(feature = "native-minifier")]
+            Minifier::Native => {
+                let contents = fs::read(input)?;
+                let minified = minify_html::minify(&contents, &native_minify_cfg());
+                fs::write(output, minified)?;
+            }
+            #[cfg(not(feature = "native-minifier"))]
+            Minifier::Native => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "the `Native` minifier requires the `native-minifier` feature",
+                ));
+            }
         }
         Ok(())
     }
@@ -256,10 +302,11 @@ pub fn get_minify_options_from_token_stream(
                 match kind.as_str() {
                     "Custom" => options.minifier = Minifier::Custom(inner),
                     "CustomUnchecked" => options.minifier = Minifier::CustomUnchecked(inner),
+                    "Native" => options.minifier = Minifier::Native,
                     _ => {
                         return Err(syn::Error::new_spanned(
                             attr,
-                            "Wrong minifier value, supported values are HTMLMinifier, Custom/CustomUnchecked(\"command\")",
+                            "Wrong minifier value, supported values are HTMLMinifier, Native, Custom/CustomUnchecked(\"command\")",
                         ))
                     }
                 }
@@ -268,10 +315,11 @@ pub fn get_minify_options_from_token_stream(
                 let ident = nv.segments.first().unwrap().ident.to_string();
                 match ident.as_str() {
                     "HTMLMinifier" => options.minifier = Minifier::HTMLMinifier,
+                    "Native" => options.minifier = Minifier::Native,
                     _ => {
                         return Err(syn::Error::new_spanned(
                             attr,
-                            "Wrong minifier value, supported values are HTMLMinifier, Custom/CustomUnchecked(\"command\")",
+                            "Wrong minifier value, supported values are HTMLMinifier, Native, Custom/CustomUnchecked(\"command\")",
                         ))
                     }
                 }
@@ -279,7 +327,7 @@ pub fn get_minify_options_from_token_stream(
             _ => {
                 return Err(syn::Error::new_spanned(
                     attr,
-                    "Wrong minifier value, supported values are HTMLMinifier, Custom/CustomUnchecked(\"command\")",
+                    "Wrong minifier value, supported values are HTMLMinifier, Native, Custom/CustomUnchecked(\"command\")",
                 ))
             }
         }
