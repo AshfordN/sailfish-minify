@@ -9,7 +9,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::{fs, io};
 use syn::ItemStruct;
 use syn::Meta;
@@ -63,6 +63,15 @@ pub fn tmp_main_path() -> &'static Path {
     TMP_MAIN_PATH.get_or_init(|| std::env::temp_dir().join("sailfish-minify"))
 }
 
+/// Cache of resolved CLI tool paths on Windows, keyed by bare command name.
+///
+/// `resolve_command` is called once per minification; the PATH search (with
+/// `.exe`/`.cmd`/`.bat`/`.ps1` candidate probes) only needs to run the first
+/// time each command is seen.
+#[cfg(windows)]
+static RESOLVED_COMMANDS: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 /// Resolve the name of a CLI tool to an absolute path on Windows.
 ///
 /// `html-minifier` is installed through npm, which only creates `*.cmd` /
@@ -71,7 +80,12 @@ pub fn tmp_main_path() -> &'static Path {
 pub fn resolve_command(name: &str) -> String {
     #[cfg(windows)]
     {
+        let mut cache = RESOLVED_COMMANDS.lock().unwrap();
+        if let Some(path) = cache.get(name) {
+            return path.clone();
+        }
         if let Some(path) = find_executable_in_path(name) {
+            cache.insert(name.to_string(), path.clone());
             return path;
         }
     }
