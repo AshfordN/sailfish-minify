@@ -19,3 +19,4 @@ templates/test/medium.stpl
 templates/test/large.stpl
 templates/test/xlarge.stpl
 templates/
+*.md

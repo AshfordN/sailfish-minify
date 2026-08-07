@@ -1,8 +1,11 @@
 use sailfish_minify_core::{
-    extract_includes, extract_template_path, get_include_regex, get_minify_options_from_token_stream,
+    extract_includes, extract_template_path, get_minify_options_from_token_stream,
     minify_file_and_components, replace_path_attribute, tmp_main_path, Minifier, MinifyOptions,
     MINIFIER_INVOCATIONS,
 };
+#[cfg(feature = "regex")]
+use sailfish_minify_core::get_include_regex;
+use sailfish_minify_core::extract_includes_manual;
 #[cfg(not(feature = "minify-components"))]
 use sailfish_minify_core::copy_referenced_template_and_includes;
 #[cfg(feature = "minify-components")]
@@ -96,6 +99,7 @@ fn test_replace_path_attribute_preserves_other_attrs() {
 // Include Regex Parsing
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "regex")]
 #[test]
 fn test_include_regex_simple() {
     let contents = r#"<div><% include!("header.stpl"); %></div>"#;
@@ -131,6 +135,38 @@ fn test_include_regex_multiple_matches() {
         extract_includes(contents),
         vec!["a.stpl", "b.stpl", "c.stpl", "d.stpl", "e.stpl"]
     );
+}
+
+#[test]
+fn test_include_manual_parser_matches_regex() {
+    // The manual parser must agree with the regex on every case the regex
+    // allows, including `\s*` (tabs/newlines) between tokens. Note the regex
+    // only permits spaces between `<%` and `include!`.
+    let contents = concat!(
+        "<main>\n",
+        "  <% include!\t(\n \"tab.stpl\"\n )\n;\n %>\n",
+        "  <p>text</p>\n",
+        "<% include!(\"with space.stpl\"); %>\n",
+        "  <% let x = 1; %>\n",
+        "<%= include!(\"not-a-path\") %>\n",
+    );
+    let manual: Vec<String> = extract_includes_manual(contents)
+        .into_iter()
+        .map(|(_, name)| name)
+        .collect();
+    assert_eq!(manual, vec!["tab.stpl", "with space.stpl"]);
+}
+
+#[test]
+fn test_include_manual_parser_spans_are_exact() {
+    // The full-match spans must round-trip exactly so `contents.replace`
+    // targets the same text the regex would have matched.
+    let contents = r#"<div><% include!("header.stpl"); %></div>"#;
+    let spans = extract_includes_manual(contents);
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].0, r#"<% include!("header.stpl"); %>"#);
+    assert_eq!(spans[0].1, "header.stpl");
+    assert!(contents.contains(&spans[0].0));
 }
 
 // ---------------------------------------------------------------------------

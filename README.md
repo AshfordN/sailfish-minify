@@ -31,6 +31,7 @@ npm `.cmd` shim is resolved automatically.
 |---------------------|-----------------------------------------------------------------------------|---------|
 | `native-minifier`   | Uses the `minify-html` crate.            | yes     |
 | `minify-components` | Also minifies templates pulled in via `<% include!(...); %>`.                | yes     |
+| `regex`             | Uses the `regex` crate to parse `<% include!(...); %>` instead of the faster dependency-free manual parser. | no      |
 
 
 With `native-minifier` disabled, the default minifier falls back to the
@@ -85,3 +86,5 @@ Example on my hardware:
 It also produces equal-or-smaller output than `html-minifier --collapse-whitespace`
 on typical sailfish templates, and does not auto-complete partial templates the way
 `html-minifier` does.
+
+Same happens for manual parsing of includes compared to regex, however the difference is extremely small in practice.

@@ -18,12 +18,16 @@ doctest = false
 default = ["minify-components", "native-minifier"]
 minify-components = []
 native-minifier = ["dep:minify-html"]
+# `regex` is used to extract `<% include!(...) %>` paths from template source.
+# Off by default: the dependency-free manual parser is faster and keeps the
+# dependency tree small. Enable only if you need the regex-based behavior.
+regex = ["dep:regex"]
 
 [dependencies]
 proc-macro2 = "1.0.101"
 syn = { version = "2.0.106", features = ["full"] }
 quote = "1.0.40"
-regex = "1.11.2"
+regex = { version = "1.11.2", optional = true }
 rayon = "1.11.0"
 pathdiff = "0.2"
 minify-html = { version = "0.15", optional = true }

@@ -1,5 +1,6 @@
 use quote::quote;
 use rayon::prelude::*;
+#[cfg(feature = "regex")]
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::fs::{create_dir_all, File};
@@ -12,10 +13,13 @@ use std::{fs, io};
 use syn::ItemStruct;
 use syn::Meta;
 
+#[cfg(feature = "regex")]
 const INCLUDE_REPLACE_TOKEN_REGEX: &str = r#"<% *include!\s*\(\s*"([^"]+)"\s*\)\s*;\s*%>"#;
 
 // Cache Regex compilation
+#[cfg(feature = "regex")]
 static INCLUDE_REGEX_CACHE: OnceLock<Regex> = OnceLock::new();
+#[cfg(feature = "regex")]
 static TEMPLATE_PATH_REGEX_CACHE: OnceLock<Regex> = OnceLock::new();
 
 // Global cache to track processed components across all template compilations
@@ -35,10 +39,12 @@ fn get_global_cache() -> &'static Mutex<HashMap<PathBuf, PathBuf>> {
     GLOBAL_PROCESSED_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[cfg(feature = "regex")]
 pub fn get_include_regex() -> &'static Regex {
     INCLUDE_REGEX_CACHE.get_or_init(|| Regex::new(INCLUDE_REPLACE_TOKEN_REGEX).unwrap())
 }
 
+#[cfg(feature = "regex")]
 fn get_template_path_regex() -> &'static Regex {
     TEMPLATE_PATH_REGEX_CACHE.get_or_init(|| {
         Regex::new(r#"#\[template\([^)]*path\s*=\s*"([^"]+)"[^)]*\)\]"#).unwrap()
@@ -84,22 +90,40 @@ fn find_executable_in_path(name: &str) -> Option<String> {
 /// Relative paths are resolved against `./templates`, absolute paths are used
 /// as-is.
 pub fn extract_template_path(str: &str) -> syn::Result<PathBuf> {
-    let template_regex = get_template_path_regex();
-
-    if let Some(captures) = template_regex.captures(str) {
-        let path = captures.get(1).expect("Cannot find path in template").as_str();
-        let path = Path::new(path);
-        if path.is_absolute() {
-            Ok(path.to_path_buf())
-        } else {
-            Ok(Path::new("./templates").join(path))
-        }
-    } else {
-        Err(syn::Error::new(
+    let path = extract_template_path_str(str).ok_or_else(|| {
+        syn::Error::new(
             proc_macro2::Span::call_site(),
             "Cannot find template path in struct attributes. Make sure to use #[template(path = \"...\")] for minified templates",
-        ))
+        )
+    })?;
+
+    let path = Path::new(&path);
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(Path::new("./templates").join(path))
     }
+}
+
+#[cfg(feature = "regex")]
+fn extract_template_path_str(str: &str) -> Option<String> {
+    let template_regex = get_template_path_regex();
+    template_regex
+        .captures(str)
+        .and_then(|captures| captures.get(1))
+        .map(|m| m.as_str().to_string())
+}
+
+/// Dependency-free fallback for `extract_template_path_str`, matching
+/// `path\s*=\s*"([^"]+)"` anywhere in the attribute string.
+#[cfg(not(feature = "regex"))]
+fn extract_template_path_str(str: &str) -> Option<String> {
+    let marker = str.find("path")?;
+    let rest = str[marker + "path".len()..].trim_start();
+    let rest = rest.strip_prefix('=')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
 }
 
 /// Compute the minified output path for a source template: the same relative
@@ -143,10 +167,108 @@ pub fn replace_path_attribute(input: proc_macro2::TokenStream, new_path: &str) -
 /// `sailfish-minify-core`.
 #[allow(dead_code)]
 pub fn extract_includes(contents: &str) -> Vec<String> {
-    get_include_regex()
-        .captures_iter(contents)
-        .map(|cap| cap[1].to_string())
+    extract_includes_spans(contents)
+        .into_iter()
+        .map(|(_, file_name)| file_name)
         .collect()
+}
+
+/// Extract every `<% include!("..."); %>` occurrence as `(full_match, file_name)`
+/// pairs, in source order.
+///
+/// Uses the `regex` engine when the `regex` feature is enabled and the
+/// dependency-free manual parser otherwise.
+pub fn extract_includes_spans(contents: &str) -> Vec<(String, String)> {
+    #[cfg(feature = "regex")]
+    {
+        get_include_regex()
+            .captures_iter(contents)
+            .map(|cap| (cap[0].to_string(), cap[1].to_string()))
+            .collect()
+    }
+    #[cfg(not(feature = "regex"))]
+    {
+        extract_includes_manual(contents)
+    }
+}
+
+/// Dependency-free manual parser for the same pattern as
+/// `INCLUDE_REPLACE_TOKEN_REGEX` (`<% *include!\s*\(\s*"([^"]+)"\s*\)\s*;\s*%>`).
+///
+/// Returns `(full_match, file_name)` pairs in source order.
+///
+/// Reachable from the `copy_referenced_template_and_includes` path and the
+/// benchmarks even when the `regex` feature is enabled, hence `dead_code`.
+#[allow(dead_code)]
+pub fn extract_includes_manual(contents: &str) -> Vec<(String, String)> {
+    let mut results = Vec::new();
+    let mut pos = 0;
+
+    while let Some(rel) = contents[pos..].find("<%") {
+        let start = pos + rel;
+        let mut rest = &contents[start + 2..];
+
+        // `rest` stays a slice of `contents` throughout, so the parsed file
+        // name remains valid once the block returns.
+        let file_name = 'parse: {
+            rest = rest.trim_start_matches(' ');
+            if !rest.starts_with("include!") {
+                break 'parse None;
+            }
+            rest = &rest["include!".len()..];
+
+            rest = rest.trim_start();
+            if !rest.starts_with('(') {
+                break 'parse None;
+            }
+            rest = &rest[1..];
+
+            rest = rest.trim_start();
+            if !rest.starts_with('"') {
+                break 'parse None;
+            }
+            rest = &rest[1..];
+
+            let Some(quote_end) = rest.find('"') else { break 'parse None };
+            let name = &rest[..quote_end];
+            if name.is_empty() {
+                break 'parse None;
+            }
+            rest = &rest[quote_end + 1..];
+
+            rest = rest.trim_start();
+            if !rest.starts_with(')') {
+                break 'parse None;
+            }
+            rest = &rest[1..];
+
+            rest = rest.trim_start();
+            if !rest.starts_with(';') {
+                break 'parse None;
+            }
+            rest = &rest[1..];
+
+            rest = rest.trim_start();
+            if !rest.starts_with("%>") {
+                break 'parse None;
+            }
+
+            Some(name)
+        };
+
+        if let Some(file_name) = file_name {
+            // `rest` currently points at the `%>`; its absolute offset in
+            // `contents` is `contents.len() - rest.len()`, so the match ends
+            // two bytes past it.
+            let end = contents.len() - rest.len() + 2;
+            results.push((contents[start..end].to_string(), file_name.to_string()));
+            pos = end;
+        } else {
+            pos = start + 2;
+        }
+    }
+
+    results
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -370,16 +492,15 @@ fn minify_file_and_components_internal(
     let mut input_file = File::open(file_path)?;
     let mut contents = String::new();
     input_file.read_to_string(&mut contents)?;
-    let include_regex = get_include_regex();
 
-    let includes: Vec<_> = include_regex.captures_iter(&contents).collect();
+    let includes = extract_includes_spans(&contents);
 
     if !includes.is_empty() {
         let parent_output_dir = new_path.parent().unwrap().to_path_buf();
         let include_results: Vec<Result<(String, String), Box<dyn std::error::Error + Send + Sync>>> =
-            includes.par_iter().map(|cap| {
-                let original_str = cap[0].to_string(); // include!("file.stpl")
-                let file_name = cap[1].to_string(); // file.stpl
+            includes.par_iter().map(|(original_str, file_name)| {
+                let original_str = original_str.clone(); // include!("file.stpl")
+                let file_name = file_name.clone(); // file.stpl
 
                 let component_file_path = file_path.parent().unwrap().join(&file_name);
 

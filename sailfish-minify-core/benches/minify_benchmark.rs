@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use sailfish_minify_core::{minify_file_and_components, MinifyOptions};
+use sailfish_minify_core::{extract_includes_manual, minify_file_and_components, MinifyOptions};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -180,11 +180,73 @@ fn bench_cache_hit_vs_miss(c: &mut Criterion) {
     group.finish();
 }
 
+fn generate_template_with_includes(count: usize) -> String {
+    let mut s = String::from("<main>\n");
+    for i in 0..count {
+        s.push_str(&format!(
+            "<section class=\"s\">\n  <p>text {}</p>\n  <% include!(\"comp{}.stpl\"); %>\n</section>\n",
+            i, i
+        ));
+    }
+    s.push_str("</main>\n");
+    s
+}
+
+fn bench_include_parse(c: &mut Criterion) {
+    let mut group = c.benchmark_group("include_parse");
+    for count in [0, 1, 10, 100, 1000].iter() {
+        let template = generate_template_with_includes(*count);
+        group.throughput(Throughput::Bytes(template.len() as u64));
+        group.bench_with_input(BenchmarkId::new("manual", count), &template, |b, t| {
+            b.iter(|| black_box(extract_includes_manual(black_box(t)).len()))
+        });
+        #[cfg(feature = "regex")]
+        group.bench_with_input(BenchmarkId::new("regex", count), &template, |b, t| {
+            b.iter(|| black_box(sailfish_minify_core::extract_includes(black_box(t)).len()))
+        });
+    }
+    group.finish();
+}
+
+/// A single repeating HTML chunk carrying 3 includes (~220 bytes each). A
+/// large file is just many of these, giving a dense include workload that
+/// stresses raw scan throughput rather than per-include call overhead.
+const LARGE_CHUNK: &str = "<section class=\"item\">\n  <h2>Heading text</h2>\n  <p>Some body copy to pad the file out to a realistic size.</p>\n  <% include!(\"a.stpl\"); %>\n  <% include!(\"b.stpl\"); %>\n  <% include!(\"c.stpl\"); %>\n</section>\n";
+
+fn generate_large_template_with_includes(target_bytes: usize) -> String {
+    let mut s = String::with_capacity(target_bytes);
+    while s.len() < target_bytes {
+        s.push_str(LARGE_CHUNK);
+    }
+    s
+}
+
+fn bench_include_parse_large(c: &mut Criterion) {
+    let mut group = c.benchmark_group("include_parse_large");
+    for size in [1_048_576, 5_242_880, 10_485_760].iter() {
+        // 1 MiB / 5 MiB / 10 MiB, each with ~3 includes per ~220-byte chunk.
+        let template = generate_large_template_with_includes(*size);
+        let include_count = extract_includes_manual(&template).len();
+        group.throughput(Throughput::Bytes(template.len() as u64));
+        group.bench_with_input(BenchmarkId::new("manual", size), &template, |b, t| {
+            b.iter(|| black_box(extract_includes_manual(black_box(t)).len()))
+        });
+        #[cfg(feature = "regex")]
+        group.bench_with_input(BenchmarkId::new("regex", size), &template, |b, t| {
+            b.iter(|| black_box(sailfish_minify_core::extract_includes(black_box(t)).len()))
+        });
+        println!("include_parse_large: {} MiB input -> {} include matches", size / 1024 / 1024, include_count);
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_template_sizes,
     bench_include_depth,
     bench_parallel_includes,
-    bench_cache_hit_vs_miss
+    bench_cache_hit_vs_miss,
+    bench_include_parse,
+    bench_include_parse_large
 );
 criterion_main!(benches);
