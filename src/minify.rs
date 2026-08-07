@@ -53,8 +53,14 @@ fn get_template_path_regex() -> &'static Regex {
 }
 
 /// Base directory where minified templates are written.
-pub fn tmp_main_path() -> PathBuf {
-    std::env::temp_dir().join("sailfish-minify")
+static TMP_MAIN_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// Base directory where minified templates are written.
+///
+/// Cached in a `OnceLock` so the `temp_dir()` syscall and `PathBuf` allocation
+/// happen only once per process.
+pub fn tmp_main_path() -> &'static Path {
+    TMP_MAIN_PATH.get_or_init(|| std::env::temp_dir().join("sailfish-minify"))
 }
 
 /// Resolve the name of a CLI tool to an absolute path on Windows.
@@ -130,7 +136,7 @@ fn extract_template_path_str(str: &str) -> Option<String> {
 /// Compute the minified output path for a source template: the same relative
 /// structure under `tmp_main_path()`, with a `.min` suffix on the file name.
 pub fn modify_template_path(path: &Path) -> PathBuf {
-    let mut new_path = tmp_main_path();
+    let mut new_path = tmp_main_path().to_path_buf();
 
     if let Some(parent) = path.parent() {
         new_path.push(parent);
@@ -564,7 +570,7 @@ fn minify_file_and_components_internal(
 
                 let component_file_path = file_path.parent().unwrap().join(&file_name);
 
-                let mut child_new_path = tmp_main_path();
+                let mut child_new_path = tmp_main_path().to_path_buf();
                 if let Some(parent) = file_path.parent() {
                     child_new_path.push(parent);
                 }
@@ -714,7 +720,7 @@ pub fn minify_template(
 
     #[cfg(not(feature = "minify-components"))]
     {
-        copy_referenced_template_and_includes(file_path, &tmp_main_path())?;
+        copy_referenced_template_and_includes(file_path, tmp_main_path())?;
         minify_options.minify_file(file_path, new_path)?;
         Ok(())
     }
