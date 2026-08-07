@@ -1,0 +1,741 @@
+use quote::quote;
+use rayon::prelude::*;
+#[cfg(feature = "regex")]
+use regex::Regex;
+use std::collections::{HashMap, HashSet};
+use std::fs::{create_dir_all, File};
+use std::io::Read;
+use std::ops::Range;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::{fs, io};
+use syn::ItemStruct;
+use syn::Meta;
+
+#[cfg(feature = "regex")]
+const INCLUDE_REPLACE_TOKEN_REGEX: &str = r#"<% *include!\s*\(\s*"([^"]+)"\s*\)\s*;\s*%>"#;
+
+// Cache Regex compilation
+#[cfg(feature = "regex")]
+static INCLUDE_REGEX_CACHE: OnceLock<Regex> = OnceLock::new();
+#[cfg(feature = "regex")]
+static TEMPLATE_PATH_REGEX_CACHE: OnceLock<Regex> = OnceLock::new();
+
+// Global cache to track processed components across all template compilations
+//
+// Only used when `minify-components` is enabled, but kept compiled in every
+// configuration because the unit tests in `sailfish-minify-core` exercise it
+// either way.
+#[allow(dead_code)]
+static GLOBAL_PROCESSED_CACHE: OnceLock<Mutex<HashMap<PathBuf, PathBuf>>> = OnceLock::new();
+
+// Used by the unit tests to verify cache behavior.
+#[doc(hidden)]
+pub static MINIFIER_INVOCATIONS: AtomicUsize = AtomicUsize::new(0);
+
+#[allow(dead_code)]
+fn get_global_cache() -> &'static Mutex<HashMap<PathBuf, PathBuf>> {
+    GLOBAL_PROCESSED_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(feature = "regex")]
+pub fn get_include_regex() -> &'static Regex {
+    INCLUDE_REGEX_CACHE.get_or_init(|| Regex::new(INCLUDE_REPLACE_TOKEN_REGEX).unwrap())
+}
+
+#[cfg(feature = "regex")]
+fn get_template_path_regex() -> &'static Regex {
+    TEMPLATE_PATH_REGEX_CACHE.get_or_init(|| {
+        Regex::new(r#"#\[template\([^)]*path\s*=\s*"([^"]+)"[^)]*\)\]"#).unwrap()
+    })
+}
+
+/// Base directory where minified templates are written.
+static TMP_MAIN_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// Base directory where minified templates are written.
+///
+/// Cached in a `OnceLock` so the `temp_dir()` syscall and `PathBuf` allocation
+/// happen only once per process.
+pub fn tmp_main_path() -> &'static Path {
+    TMP_MAIN_PATH.get_or_init(|| std::env::temp_dir().join("sailfish-minify"))
+}
+
+/// Cache of resolved CLI tool paths on Windows, keyed by bare command name.
+///
+/// `resolve_command` is called once per minification; the PATH search (with
+/// `.exe`/`.cmd`/`.bat`/`.ps1` candidate probes) only needs to run the first
+/// time each command is seen.
+#[cfg(windows)]
+static RESOLVED_COMMANDS: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Resolve the name of a CLI tool to an absolute path on Windows.
+///
+/// `html-minifier` is installed through npm, which only creates `*.cmd` /
+/// `*.ps1` shims. Rust's `std::process::Command` cannot execute those by bare
+/// name, so we search `PATH` and hand back the full path instead.
+pub fn resolve_command(name: &str) -> String {
+    #[cfg(windows)]
+    {
+        let mut cache = RESOLVED_COMMANDS.lock().unwrap();
+        if let Some(path) = cache.get(name) {
+            return path.clone();
+        }
+        if let Some(path) = find_executable_in_path(name) {
+            cache.insert(name.to_string(), path.clone());
+            return path;
+        }
+    }
+    name.to_string()
+}
+
+#[cfg(windows)]
+fn find_executable_in_path(name: &str) -> Option<String> {
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    for dir in std::env::split_paths(&path_var) {
+        for ext in ["exe", "cmd", "bat", "ps1"] {
+            let candidate = dir.join(format!("{name}.{ext}"));
+            if candidate.is_file() {
+                return Some(candidate.to_string_lossy().into_owned());
+            }
+        }
+    }
+    None
+}
+
+/// Extract the template file path from a `#[template(path = "...")]` attribute.
+///
+/// Relative paths are resolved against `./templates`, absolute paths are used
+/// as-is.
+pub fn extract_template_path(str: &str) -> syn::Result<PathBuf> {
+    let path = extract_template_path_str(str).ok_or_else(|| {
+        syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "Cannot find template path in struct attributes. Make sure to use #[template(path = \"...\")] for minified templates",
+        )
+    })?;
+
+    let path = Path::new(&path);
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(Path::new("./templates").join(path))
+    }
+}
+
+#[cfg(feature = "regex")]
+fn extract_template_path_str(str: &str) -> Option<String> {
+    let template_regex = get_template_path_regex();
+    template_regex
+        .captures(str)
+        .and_then(|captures| captures.get(1))
+        .map(|m| m.as_str().to_string())
+}
+
+/// Dependency-free fallback for `extract_template_path_str`, matching
+/// `path\s*=\s*"([^"]+)"` anywhere in the attribute string.
+#[cfg(not(feature = "regex"))]
+fn extract_template_path_str(str: &str) -> Option<String> {
+    let marker = str.find("path")?;
+    let rest = str[marker + "path".len()..].trim_start();
+    let rest = rest.strip_prefix('=')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// Compute the minified output path for a source template: the same relative
+/// structure under `tmp_main_path()`, with a `.min` suffix on the file name.
+pub fn modify_template_path(path: &Path) -> PathBuf {
+    let mut new_path = tmp_main_path().to_path_buf();
+
+    if let Some(parent) = path.parent() {
+        new_path.push(parent);
+    }
+
+    if let Some(file_name) = path.file_name() {
+        new_path.push(format!("{}.min", file_name.to_str().unwrap()));
+    }
+    new_path
+}
+
+/// Rewrite the `#[template(path = "...")]` attribute to point at the minified file.
+pub fn replace_path_attribute(input: proc_macro2::TokenStream, new_path: &str) -> proc_macro2::TokenStream {
+    let mut struct_item = syn::parse2::<ItemStruct>(input).unwrap_or_else(|_| {
+        panic!("sailfish-minify: expected a struct for #[derive(TemplateSimple)]")
+    });
+
+    for attr in &mut struct_item.attrs {
+        if attr.path().is_ident("template") {
+            let new_attr = syn::parse_quote! { #[template(path = #new_path)] };
+            *attr = new_attr;
+            break;
+        }
+    }
+
+    quote! {
+        #struct_item
+    }
+}
+
+/// Extract the file names referenced by `<% include!("..."); %>` macros.
+///
+/// Only used by the `copy_referenced_template_and_includes` path (compiled when
+/// `minify-components` is disabled) and by the unit tests in
+/// `sailfish-minify-core`.
+#[allow(dead_code)]
+pub fn extract_includes(contents: &str) -> Vec<String> {
+    extract_include_ranges(contents)
+        .into_iter()
+        .map(|(_, _, file_name)| file_name)
+        .collect()
+}
+
+/// Extract every `<% include!("..."); %>` occurrence as
+/// `(byte_range, full_match, file_name)` triples, in source order. The byte
+/// range covers the full `include!` token, so callers can splice replacements
+/// back into the source without re-scanning it.
+///
+/// Uses the `regex` engine when the `regex` feature is enabled and the
+/// dependency-free manual parser otherwise.
+pub fn extract_include_ranges(contents: &str) -> Vec<(Range<usize>, String, String)> {
+    #[cfg(feature = "regex")]
+    {
+        get_include_regex()
+            .captures_iter(contents)
+            .map(|cap| {
+                let m = cap.get(0).unwrap();
+                (m.range(), cap[0].to_string(), cap[1].to_string())
+            })
+            .collect()
+    }
+    #[cfg(not(feature = "regex"))]
+    {
+        extract_includes_manual_ranges(contents)
+    }
+}
+
+/// Extract every `<% include!("..."); %>` occurrence as `(full_match, file_name)`
+/// pairs, in source order.
+///
+/// Reachable from the unit tests and benchmarks even when the `regex` feature
+/// is enabled, hence `dead_code`.
+#[allow(dead_code)]
+pub fn extract_includes_spans(contents: &str) -> Vec<(String, String)> {
+    extract_include_ranges(contents)
+        .into_iter()
+        .map(|(_, full_match, file_name)| (full_match, file_name))
+        .collect()
+}
+
+/// Dependency-free manual parser for the same pattern as
+/// `INCLUDE_REPLACE_TOKEN_REGEX` (`<% *include!\s*\(\s*"([^"]+)"\s*\)\s*;\s*%>`).
+///
+/// Returns `(full_match, file_name)` pairs in source order.
+///
+/// Reachable from the `copy_referenced_template_and_includes` path and the
+/// benchmarks even when the `regex` feature is enabled, hence `dead_code`.
+#[allow(dead_code)]
+pub fn extract_includes_manual(contents: &str) -> Vec<(String, String)> {
+    extract_includes_manual_ranges(contents)
+        .into_iter()
+        .map(|(_, full_match, file_name)| (full_match, file_name))
+        .collect()
+}
+
+/// Dependency-free manual parser returning `(byte_range, full_match, file_name)`
+/// triples in source order.
+///
+/// `full_match` is kept alongside the byte range so callers that only need the
+/// text (e.g. the unit tests) can share this parser.
+#[allow(dead_code)]
+fn extract_includes_manual_ranges(contents: &str) -> Vec<(Range<usize>, String, String)> {
+    let mut results = Vec::new();
+    let mut pos = 0;
+
+    while let Some(rel) = contents[pos..].find("<%") {
+        let start = pos + rel;
+        let mut rest = &contents[start + 2..];
+
+        // `rest` stays a slice of `contents` throughout, so the parsed file
+        // name remains valid once the block returns.
+        let file_name = 'parse: {
+            rest = rest.trim_start_matches(' ');
+            if !rest.starts_with("include!") {
+                break 'parse None;
+            }
+            rest = &rest["include!".len()..];
+
+            rest = rest.trim_start();
+            if !rest.starts_with('(') {
+                break 'parse None;
+            }
+            rest = &rest[1..];
+
+            rest = rest.trim_start();
+            if !rest.starts_with('"') {
+                break 'parse None;
+            }
+            rest = &rest[1..];
+
+            let Some(quote_end) = rest.find('"') else { break 'parse None };
+            let name = &rest[..quote_end];
+            if name.is_empty() {
+                break 'parse None;
+            }
+            rest = &rest[quote_end + 1..];
+
+            rest = rest.trim_start();
+            if !rest.starts_with(')') {
+                break 'parse None;
+            }
+            rest = &rest[1..];
+
+            rest = rest.trim_start();
+            if !rest.starts_with(';') {
+                break 'parse None;
+            }
+            rest = &rest[1..];
+
+            rest = rest.trim_start();
+            if !rest.starts_with("%>") {
+                break 'parse None;
+            }
+
+            Some(name)
+        };
+
+        if let Some(file_name) = file_name {
+            // `rest` currently points at the `%>`; its absolute offset in
+            // `contents` is `contents.len() - rest.len()`, so the match ends
+            // two bytes past it.
+            let end = contents.len() - rest.len() + 2;
+            results.push((start..end, contents[start..end].to_string(), file_name.to_string()));
+            pos = end;
+        } else {
+            pos = start + 2;
+        }
+    }
+
+    results
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::enum_variant_names)]
+pub enum Minifier {
+    /// Minify with the `html-minifier` CLI (must be installed and on `PATH`).
+    HTMLMinifier,
+    Custom(String),
+    CustomUnchecked(String),
+    /// Pure-Rust minifier (`minify-html`), enabled by the `native-minifier`
+    /// feature. No `Command` spawn, no system dependency, WASM-compatible.
+    /// This is the default minifier.
+    Native,
+}
+
+/// Build the `minify-html` configuration used by `Minifier::Native`.
+///
+/// Based on the spec-compliant preset so the output is safe, but tuned for
+/// sailfish templates and for parity with the default `html-minifier
+/// --collapse-whitespace` invocation: `<% ... %>` blocks are passed through
+/// untouched, comments are kept, and optional closing tags are not omitted.
+#[cfg(feature = "native-minifier")]
+pub fn native_minify_cfg() -> minify_html::Cfg {
+    let mut cfg = minify_html::Cfg::spec_compliant();
+    cfg.preserve_chevron_percent_template_syntax = true;
+    cfg.keep_comments = true;
+    cfg.keep_closing_tags = true;
+    cfg
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MinifyOptions {
+    pub minifier: Minifier,
+}
+
+impl Default for MinifyOptions {
+    fn default() -> Self {
+        MinifyOptions {
+            // The `Native` minifier is the default when the `native-minifier`
+            // feature is enabled. Without it (e.g. `--no-default-features`),
+            // fall back to the `html-minifier` CLI so templates still minify.
+            #[cfg(feature = "native-minifier")]
+            minifier: Minifier::Native,
+            #[cfg(not(feature = "native-minifier"))]
+            minifier: Minifier::HTMLMinifier,
+        }
+    }
+}
+
+fn run_custom_command_unchecked(cmd: &[&str]) -> Output {
+    let program = resolve_command(cmd[0]);
+    Command::new(program)
+        .args(cmd.iter().skip(1))
+        .output()
+        .expect("Failed to run minifier")
+}
+
+fn run_custom_command(cmd: &[&str]) -> Output {
+    let out = run_custom_command_unchecked(cmd);
+    if !out.stderr.is_empty() {
+        panic!(
+            "Minifier ran with error  {:?}",
+            String::from_utf8(out.stderr).unwrap()
+        )
+    }
+    out
+}
+
+fn run_custom_command_unchecked_wrapper(command: &str, input: &Path, output: &Path) -> Output {
+    let mut cmd: Vec<&str> = command.split([' ', '\n']).collect();
+    cmd.extend(vec![
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+    ]);
+    run_custom_command_unchecked(&cmd)
+}
+
+/// Extract the argument of a `Custom(...)` / `CustomUnchecked(...)` minifier.
+///
+/// Accepts both a quoted string literal (`Custom("cmd --flag")`) and bare
+/// tokens (`Custom(cmd --flag)`).
+fn parse_command_arg(tokens: &proc_macro2::TokenStream) -> String {
+    if let Ok(lit) = syn::parse2::<syn::LitStr>(tokens.clone()) {
+        lit.value()
+    } else {
+        tokens.to_string()
+    }
+}
+
+impl MinifyOptions {
+    pub fn minify_file(&self, input: &Path, output: &Path) -> io::Result<()> {
+        MINIFIER_INVOCATIONS.fetch_add(1, Ordering::SeqCst);
+        match &self.minifier {
+            Minifier::HTMLMinifier => {
+                run_custom_command(&[
+                    "html-minifier",
+                    "--collapse-whitespace",
+                    input.to_str().unwrap(),
+                    "-o",
+                    output.to_str().unwrap(),
+                ]);
+            }
+            Minifier::Custom(command) => {
+                let out = run_custom_command_unchecked_wrapper(command, input, output);
+
+                if !out.stderr.is_empty() {
+                    panic!(
+                        "Minifier ran with error  {:?}",
+                        String::from_utf8(out.stderr).unwrap()
+                    )
+                }
+            }
+            Minifier::CustomUnchecked(command) => {
+                run_custom_command_unchecked_wrapper(command, input, output);
+            }
+            #[cfg(feature = "native-minifier")]
+            Minifier::Native => {
+                let contents = fs::read(input)?;
+                let minified = minify_html::minify(&contents, &native_minify_cfg());
+                fs::write(output, minified)?;
+            }
+            #[cfg(not(feature = "native-minifier"))]
+            Minifier::Native => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "the `Native` minifier requires the `native-minifier` feature",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Parse `#[min_with(...)]` attributes from a struct's token stream and apply
+/// them to the given `MinifyOptions`.
+pub fn get_minify_options_from_token_stream(
+    tokens: proc_macro2::TokenStream,
+    options: &mut MinifyOptions,
+) -> syn::Result<()> {
+    let struct_item = syn::parse2::<ItemStruct>(tokens)?;
+
+    for attr in &struct_item.attrs {
+        if !attr.path().is_ident("min_with") {
+            continue;
+        }
+
+        let parsed_args = attr.parse_args()?;
+        match parsed_args {
+            Meta::List(nv) => {
+                let kind = nv.path.segments.first().unwrap().ident.to_string();
+                let inner = parse_command_arg(&nv.tokens);
+                match kind.as_str() {
+                    "Custom" => options.minifier = Minifier::Custom(inner),
+                    "CustomUnchecked" => options.minifier = Minifier::CustomUnchecked(inner),
+                    "Native" => options.minifier = Minifier::Native,
+                    _ => {
+                        return Err(syn::Error::new_spanned(
+                            attr,
+                            "Wrong minifier value, supported values are HTMLMinifier, Native, Custom/CustomUnchecked(\"command\")",
+                        ))
+                    }
+                }
+            }
+            Meta::Path(nv) => {
+                let ident = nv.segments.first().unwrap().ident.to_string();
+                match ident.as_str() {
+                    "HTMLMinifier" => options.minifier = Minifier::HTMLMinifier,
+                    "Native" => options.minifier = Minifier::Native,
+                    _ => {
+                        return Err(syn::Error::new_spanned(
+                            attr,
+                            "Wrong minifier value, supported values are HTMLMinifier, Native, Custom/CustomUnchecked(\"command\")",
+                        ))
+                    }
+                }
+            }
+            _ => {
+                return Err(syn::Error::new_spanned(
+                    attr,
+                    "Wrong minifier value, supported values are HTMLMinifier, Native, Custom/CustomUnchecked(\"command\")",
+                ))
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Apply include rewrites to `contents` in a single pass.
+///
+/// `replacements` holds `(byte_range, replacement)` pairs, each range spanning
+/// one `<% include!("..."); %>` token. Because the ranges are disjoint and
+/// sorted, one forward scan splices every replacement in, avoiding the N scans
+/// and N allocations of a sequential `String::replace` loop.
+pub fn splice_include_replacements(
+    contents: &str,
+    mut replacements: Vec<(Range<usize>, String)>,
+) -> String {
+    replacements.sort_by_key(|(range, _)| range.start);
+
+    let mut out = String::with_capacity(contents.len());
+    let mut cursor = 0;
+    for (range, replacement) in &replacements {
+        debug_assert!(range.start >= cursor, "replacement ranges must be sorted and disjoint");
+        out.push_str(&contents[cursor..range.start]);
+        out.push_str(replacement);
+        cursor = range.end;
+    }
+    out.push_str(&contents[cursor..]);
+    out
+}
+
+/// Per-include processing outcome: the byte range of the `<% include!(...) %>`
+/// token plus its rewritten text, or the error from minifying the component.
+type IncludeRewriteResult = Result<(Range<usize>, String), Box<dyn std::error::Error + Send + Sync>>;
+
+#[allow(dead_code)]
+fn minify_file_and_components_internal(
+    file_path: &Path,
+    new_path: &Path,
+    minify_options: &MinifyOptions,
+    processed_files: Arc<Mutex<HashSet<PathBuf>>>,
+) -> io::Result<()> {
+    let canonical_path = file_path.canonicalize().unwrap_or_else(|_| file_path.to_path_buf());
+
+    // Check local cache first (for same template)
+    {
+        let processed = processed_files.lock().unwrap();
+        if processed.contains(&canonical_path) {
+            return Ok(());
+        }
+    }
+
+    {
+        let global_cache = get_global_cache().lock().unwrap();
+        if let Some(cached_output_path) = global_cache.get(&canonical_path) {
+            if cached_output_path.as_path().exists() && new_path != cached_output_path.as_path() {
+                create_dir_all(new_path.parent().unwrap()).expect("Cannot create dir");
+                fs::copy(cached_output_path, new_path)?;
+            }
+            processed_files.lock().unwrap().insert(canonical_path);
+            return Ok(());
+        }
+    }
+
+    processed_files.lock().unwrap().insert(canonical_path.clone());
+
+    let mut input_file = File::open(file_path)?;
+    let mut contents = String::new();
+    input_file.read_to_string(&mut contents)?;
+
+    let includes = extract_include_ranges(&contents);
+
+    if !includes.is_empty() {
+        let parent_output_dir = new_path.parent().unwrap().to_path_buf();
+        let include_results: Vec<IncludeRewriteResult> =
+            includes.par_iter().map(|(range, _original_str, file_name)| {
+                let range = range.clone();
+                let file_name = file_name.clone(); // file.stpl
+
+                let component_file_path = file_path.parent().unwrap().join(&file_name);
+
+                let mut child_new_path = tmp_main_path().to_path_buf();
+                if let Some(parent) = file_path.parent() {
+                    child_new_path.push(parent);
+                }
+                child_new_path.push(format!("{}.min", file_name));
+
+                minify_file_and_components_internal(
+                    &component_file_path,
+                    &child_new_path,
+                    minify_options,
+                    Arc::clone(&processed_files),
+                )
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+                // Rewrite the include to a path relative to the minified parent.
+                // Relative (rather than absolute) paths are required on Windows:
+                // sailfish-compiler strips the first character of absolute include
+                // paths, which mangles `C:\...` style paths.
+                let relative_path = pathdiff::diff_paths(&child_new_path, &parent_output_dir)
+                    .unwrap_or_else(|| child_new_path.clone());
+                let new_include = format!(r#"<% include!("{}"); %>"#, relative_path.to_string_lossy());
+
+                Ok((range, new_include))
+            }).collect();
+
+        // Fold the per-include results into position-sorted replacements. The
+        // byte ranges are already in source order (extraction is ordered and
+        // `par_iter` preserves it), so the splice below needs a single pass.
+        let mut replacements = Vec::with_capacity(include_results.len());
+        for result in include_results {
+            match result {
+                Ok((range, new_include)) => replacements.push((range, new_include)),
+                Err(e) => {
+                    eprintln!("Error processing component: {}", e);
+                    return Err(io::Error::other("Component processing failed"));
+                }
+            }
+        }
+
+        contents = splice_include_replacements(&contents, replacements);
+    }
+
+    create_dir_all(new_path.parent().unwrap())?;
+
+    // Fast path for the in-process `Native` minifier: the minified output is
+    // already in memory, so write it directly and skip the unminified
+    // write → read → minified write disk roundtrip (saves two syscalls per
+    // template, meaningful for deeply nested or many-include templates).
+    let minified = {
+        #[cfg(feature = "native-minifier")]
+        {
+            if matches!(minify_options.minifier, Minifier::Native) {
+                // Keep the invocation counter in sync: `minify_file` is what
+                // the unit tests use to observe cache behavior, and the fast
+                // path performs the same minification without calling it.
+                MINIFIER_INVOCATIONS.fetch_add(1, Ordering::SeqCst);
+                Some(minify_html::minify(contents.as_bytes(), &native_minify_cfg()))
+            } else {
+                None
+            }
+        }
+        #[cfg(not(feature = "native-minifier"))]
+        {
+            None
+        }
+    };
+
+    if let Some(minified) = minified {
+        fs::write(new_path, minified)?;
+    } else {
+        fs::write(new_path, contents)?;
+        minify_options.minify_file(new_path, new_path)?;
+    }
+
+    {
+        let mut global_cache = get_global_cache().lock().unwrap();
+        global_cache.insert(canonical_path, new_path.to_path_buf());
+    }
+
+    Ok(())
+}
+
+/// Minify a template and all of its includes recursively. Only used when the
+/// `minify-components` feature is enabled, but kept compiled in every
+/// configuration because the unit tests in `sailfish-minify-core` exercise it
+/// either way.
+#[allow(dead_code)]
+pub fn minify_file_and_components(
+    file_path: &Path,
+    new_path: &Path,
+    minify_options: &MinifyOptions,
+) -> io::Result<()> {
+    let processed_files = Arc::new(Mutex::new(HashSet::new()));
+    minify_file_and_components_internal(file_path, new_path, minify_options, processed_files)
+}
+
+/// Copy a template and every template it transitively includes into `base`,
+/// preserving the relative directory structure. Used when the
+/// `minify-components` feature is disabled, so only the templates that are
+/// actually referenced end up in the temp dir.
+#[allow(dead_code)]
+pub fn copy_referenced_template_and_includes(source: &Path, base: &Path) -> io::Result<()> {
+    let mut visited = HashSet::new();
+    copy_referenced_template_and_includes_inner(source, base, &mut visited)
+}
+
+#[allow(dead_code)]
+fn copy_referenced_template_and_includes_inner(
+    source: &Path,
+    base: &Path,
+    visited: &mut HashSet<PathBuf>,
+) -> io::Result<()> {
+    let canonical = source.canonicalize().unwrap_or_else(|_| source.to_path_buf());
+    if !visited.insert(canonical) {
+        return Ok(());
+    }
+
+    let destination = base.join(source);
+    if let Some(parent) = destination.parent() {
+        create_dir_all(parent)?;
+    }
+    fs::copy(source, &destination)?;
+
+    let contents = fs::read_to_string(source)?;
+    for file_name in extract_includes(&contents) {
+        let child = source.parent().unwrap().join(file_name);
+        copy_referenced_template_and_includes_inner(&child, base, visited)?;
+    }
+
+    Ok(())
+}
+
+/// Minify a single template according to the enabled features.
+///
+/// * `minify-components` enabled: recursively minify the template and all of
+///   its includes into the temp dir, rewriting include paths.
+/// * disabled: copy only the referenced templates into the temp dir, then
+///   minify the referenced file in place.
+pub fn minify_template(
+    file_path: &Path,
+    new_path: &Path,
+    minify_options: &MinifyOptions,
+) -> io::Result<()> {
+    #[cfg(feature = "minify-components")]
+    {
+        minify_file_and_components(file_path, new_path, minify_options)
+    }
+
+    #[cfg(not(feature = "minify-components"))]
+    {
+        copy_referenced_template_and_includes(file_path, tmp_main_path())?;
+        minify_options.minify_file(file_path, new_path)?;
+        Ok(())
+    }
+}
