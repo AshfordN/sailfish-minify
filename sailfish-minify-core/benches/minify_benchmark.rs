@@ -1,5 +1,8 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use sailfish_minify_core::{extract_includes_manual, minify_file_and_components, MinifyOptions};
+use sailfish_minify_core::{
+    extract_includes_manual, minify_file_and_components, splice_include_replacements,
+    MinifyOptions,
+};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -240,6 +243,91 @@ fn bench_include_parse_large(c: &mut Criterion) {
     group.finish();
 }
 
+/// A large template of `target_bytes` whose body repeats `count` distinct
+/// `<% include!(...) %>` tokens cyclically. Each distinct token recurs many
+/// times, so a sequential `.replace()` loop re-scans the whole file once per
+/// distinct token, which is the exact cost profile the single-pass splice
+/// eliminates.
+fn generate_replace_workload(target_bytes: usize, count: usize) -> String {
+    let mut s = String::with_capacity(target_bytes + 256);
+    while s.len() < target_bytes {
+        for i in 0..count {
+            s.push_str(&format!("<% include!(\"comp{}.stpl\"); %>", i));
+            s.push_str("<p>Lorem ipsum dolor sit amet consectetur.</p>\n");
+        }
+    }
+    s
+}
+
+/// Benchmarks the two ways of applying include-path rewrites to a template:
+/// the old sequential `String::replace` loop (N scans + N allocations) versus
+/// the new single-pass splice (1 scan + 1 allocation).
+fn bench_include_replace(c: &mut Criterion) {
+    let mut group = c.benchmark_group("include_replace");
+    for (size, count) in [(1 << 16, 10), (1 << 18, 50), (1 << 18, 200)] {
+        // 64 KiB body with 10 tokens; 256 KiB bodies with 50 / 200 tokens.
+        let template = generate_replace_workload(size, count);
+
+        // Needle -> replacement pairs, exactly as the sequential loop consumed
+        // them (each distinct token appears many times in the body).
+        let needles: Vec<(String, String)> = extract_includes_manual(&template)
+            .into_iter()
+            .map(|(full, name)| {
+                let rewritten = format!(r#"<% include!("rewritten/{}.min"); %>"#, name);
+                (full, rewritten)
+            })
+            .collect();
+
+        // Position-based replacements, exactly as the single-pass splice
+        // consumes them.
+        let ranges: Vec<(std::ops::Range<usize>, String)> =
+            sailfish_minify_core::extract_include_ranges(&template)
+                .into_iter()
+                .map(|(range, _full, name)| {
+                    (range, format!(r#"<% include!("rewritten/{}.min"); %>"#, name))
+                })
+                .collect();
+        assert_eq!(needles.len(), ranges.len(), "both approaches must see the same replacements");
+
+        // Both approaches must produce byte-identical output on this workload.
+        let sequential = {
+            let mut contents = template.clone();
+            for (original, rewritten) in &needles {
+                contents = contents.replace(original, rewritten);
+            }
+            contents
+        };
+        let spliced = splice_include_replacements(&template, ranges.clone());
+        assert_eq!(sequential, spliced, "single-pass splice must match sequential replace");
+
+        group.throughput(Throughput::Bytes(template.len() as u64));
+        group.bench_with_input(
+            BenchmarkId::new("sequential-replace", count),
+            &(&template, &needles),
+            |b, (template, needles)| {
+                b.iter(|| {
+                    let mut contents = template.to_string();
+                    for (original, rewritten) in needles.iter() {
+                        contents = contents.replace(original.as_str(), rewritten.as_str());
+                    }
+                    black_box(contents)
+                })
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("single-pass-splice", count),
+            &(&template, &ranges),
+            |b, (template, ranges)| {
+                b.iter(|| {
+                    let replacements = ranges.to_vec();
+                    black_box(splice_include_replacements(template.as_str(), replacements))
+                })
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_template_sizes,
@@ -247,6 +335,7 @@ criterion_group!(
     bench_parallel_includes,
     bench_cache_hit_vs_miss,
     bench_include_parse,
-    bench_include_parse_large
+    bench_include_parse_large,
+    bench_include_replace
 );
 criterion_main!(benches);

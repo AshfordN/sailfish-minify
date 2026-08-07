@@ -5,6 +5,7 @@ use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::fs::{create_dir_all, File};
 use std::io::Read;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -167,29 +168,47 @@ pub fn replace_path_attribute(input: proc_macro2::TokenStream, new_path: &str) -
 /// `sailfish-minify-core`.
 #[allow(dead_code)]
 pub fn extract_includes(contents: &str) -> Vec<String> {
-    extract_includes_spans(contents)
+    extract_include_ranges(contents)
         .into_iter()
-        .map(|(_, file_name)| file_name)
+        .map(|(_, _, file_name)| file_name)
         .collect()
+}
+
+/// Extract every `<% include!("..."); %>` occurrence as
+/// `(byte_range, full_match, file_name)` triples, in source order. The byte
+/// range covers the full `include!` token, so callers can splice replacements
+/// back into the source without re-scanning it.
+///
+/// Uses the `regex` engine when the `regex` feature is enabled and the
+/// dependency-free manual parser otherwise.
+pub fn extract_include_ranges(contents: &str) -> Vec<(Range<usize>, String, String)> {
+    #[cfg(feature = "regex")]
+    {
+        get_include_regex()
+            .captures_iter(contents)
+            .map(|cap| {
+                let m = cap.get(0).unwrap();
+                (m.range(), cap[0].to_string(), cap[1].to_string())
+            })
+            .collect()
+    }
+    #[cfg(not(feature = "regex"))]
+    {
+        extract_includes_manual_ranges(contents)
+    }
 }
 
 /// Extract every `<% include!("..."); %>` occurrence as `(full_match, file_name)`
 /// pairs, in source order.
 ///
-/// Uses the `regex` engine when the `regex` feature is enabled and the
-/// dependency-free manual parser otherwise.
+/// Reachable from the unit tests and benchmarks even when the `regex` feature
+/// is enabled, hence `dead_code`.
+#[allow(dead_code)]
 pub fn extract_includes_spans(contents: &str) -> Vec<(String, String)> {
-    #[cfg(feature = "regex")]
-    {
-        get_include_regex()
-            .captures_iter(contents)
-            .map(|cap| (cap[0].to_string(), cap[1].to_string()))
-            .collect()
-    }
-    #[cfg(not(feature = "regex"))]
-    {
-        extract_includes_manual(contents)
-    }
+    extract_include_ranges(contents)
+        .into_iter()
+        .map(|(_, full_match, file_name)| (full_match, file_name))
+        .collect()
 }
 
 /// Dependency-free manual parser for the same pattern as
@@ -201,6 +220,19 @@ pub fn extract_includes_spans(contents: &str) -> Vec<(String, String)> {
 /// benchmarks even when the `regex` feature is enabled, hence `dead_code`.
 #[allow(dead_code)]
 pub fn extract_includes_manual(contents: &str) -> Vec<(String, String)> {
+    extract_includes_manual_ranges(contents)
+        .into_iter()
+        .map(|(_, full_match, file_name)| (full_match, file_name))
+        .collect()
+}
+
+/// Dependency-free manual parser returning `(byte_range, full_match, file_name)`
+/// triples in source order.
+///
+/// `full_match` is kept alongside the byte range so callers that only need the
+/// text (e.g. the unit tests) can share this parser.
+#[allow(dead_code)]
+fn extract_includes_manual_ranges(contents: &str) -> Vec<(Range<usize>, String, String)> {
     let mut results = Vec::new();
     let mut pos = 0;
 
@@ -261,7 +293,7 @@ pub fn extract_includes_manual(contents: &str) -> Vec<(String, String)> {
             // `contents` is `contents.len() - rest.len()`, so the match ends
             // two bytes past it.
             let end = contents.len() - rest.len() + 2;
-            results.push((contents[start..end].to_string(), file_name.to_string()));
+            results.push((start..end, contents[start..end].to_string(), file_name.to_string()));
             pos = end;
         } else {
             pos = start + 2;
@@ -458,6 +490,34 @@ pub fn get_minify_options_from_token_stream(
     Ok(())
 }
 
+/// Apply include rewrites to `contents` in a single pass.
+///
+/// `replacements` holds `(byte_range, replacement)` pairs, each range spanning
+/// one `<% include!("..."); %>` token. Because the ranges are disjoint and
+/// sorted, one forward scan splices every replacement in, avoiding the N scans
+/// and N allocations of a sequential `String::replace` loop.
+pub fn splice_include_replacements(
+    contents: &str,
+    mut replacements: Vec<(Range<usize>, String)>,
+) -> String {
+    replacements.sort_by_key(|(range, _)| range.start);
+
+    let mut out = String::with_capacity(contents.len());
+    let mut cursor = 0;
+    for (range, replacement) in &replacements {
+        debug_assert!(range.start >= cursor, "replacement ranges must be sorted and disjoint");
+        out.push_str(&contents[cursor..range.start]);
+        out.push_str(replacement);
+        cursor = range.end;
+    }
+    out.push_str(&contents[cursor..]);
+    out
+}
+
+/// Per-include processing outcome: the byte range of the `<% include!(...) %>`
+/// token plus its rewritten text, or the error from minifying the component.
+type IncludeRewriteResult = Result<(Range<usize>, String), Box<dyn std::error::Error + Send + Sync>>;
+
 #[allow(dead_code)]
 fn minify_file_and_components_internal(
     file_path: &Path,
@@ -493,13 +553,13 @@ fn minify_file_and_components_internal(
     let mut contents = String::new();
     input_file.read_to_string(&mut contents)?;
 
-    let includes = extract_includes_spans(&contents);
+    let includes = extract_include_ranges(&contents);
 
     if !includes.is_empty() {
         let parent_output_dir = new_path.parent().unwrap().to_path_buf();
-        let include_results: Vec<Result<(String, String), Box<dyn std::error::Error + Send + Sync>>> =
-            includes.par_iter().map(|(original_str, file_name)| {
-                let original_str = original_str.clone(); // include!("file.stpl")
+        let include_results: Vec<IncludeRewriteResult> =
+            includes.par_iter().map(|(range, _original_str, file_name)| {
+                let range = range.clone();
                 let file_name = file_name.clone(); // file.stpl
 
                 let component_file_path = file_path.parent().unwrap().join(&file_name);
@@ -526,20 +586,24 @@ fn minify_file_and_components_internal(
                     .unwrap_or_else(|| child_new_path.clone());
                 let new_include = format!(r#"<% include!("{}"); %>"#, relative_path.to_string_lossy());
 
-                Ok((original_str, new_include))
+                Ok((range, new_include))
             }).collect();
 
+        // Fold the per-include results into position-sorted replacements. The
+        // byte ranges are already in source order (extraction is ordered and
+        // `par_iter` preserves it), so the splice below needs a single pass.
+        let mut replacements = Vec::with_capacity(include_results.len());
         for result in include_results {
             match result {
-                Ok((original_str, new_include)) => {
-                    contents = contents.replace(&original_str, &new_include);
-                }
+                Ok((range, new_include)) => replacements.push((range, new_include)),
                 Err(e) => {
                     eprintln!("Error processing component: {}", e);
                     return Err(io::Error::other("Component processing failed"));
                 }
             }
         }
+
+        contents = splice_include_replacements(&contents, replacements);
     }
 
     create_dir_all(new_path.parent().unwrap())?;
