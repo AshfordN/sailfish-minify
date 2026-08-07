@@ -542,9 +542,37 @@ fn minify_file_and_components_internal(
         }
     }
 
-    create_dir_all(new_path.parent().unwrap()).expect("Cannot create dir");
-    fs::write(new_path, contents)?;
-    minify_options.minify_file(new_path, new_path)?;
+    create_dir_all(new_path.parent().unwrap())?;
+
+    // Fast path for the in-process `Native` minifier: the minified output is
+    // already in memory, so write it directly and skip the unminified
+    // write → read → minified write disk roundtrip (saves two syscalls per
+    // template, meaningful for deeply nested or many-include templates).
+    let minified = {
+        #[cfg(feature = "native-minifier")]
+        {
+            if matches!(minify_options.minifier, Minifier::Native) {
+                // Keep the invocation counter in sync: `minify_file` is what
+                // the unit tests use to observe cache behavior, and the fast
+                // path performs the same minification without calling it.
+                MINIFIER_INVOCATIONS.fetch_add(1, Ordering::SeqCst);
+                Some(minify_html::minify(contents.as_bytes(), &native_minify_cfg()))
+            } else {
+                None
+            }
+        }
+        #[cfg(not(feature = "native-minifier"))]
+        {
+            None
+        }
+    };
+
+    if let Some(minified) = minified {
+        fs::write(new_path, minified)?;
+    } else {
+        fs::write(new_path, contents)?;
+        minify_options.minify_file(new_path, new_path)?;
+    }
 
     {
         let mut global_cache = get_global_cache().lock().unwrap();
